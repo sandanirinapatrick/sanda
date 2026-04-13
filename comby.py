@@ -3,7 +3,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   6 BOTS IA TRADING — SMC / ICT / VWAP / VOLUME             ║
-║   Données : cTrader Open API (temps réel)                    ║
+║   Données : MetaTrader 5 (temps réel)                        ║
 ║   Symbole : XAUUSD uniquement                                ║
 ║   Bot 1 : Swing Très Puissant                                ║
 ║   Bot 2 : Day Trading Puissant (Arbre)                       ║
@@ -20,18 +20,16 @@ requirements.txt :
     numpy
     plotly
     requests
-    ctrader-open-api
-    twisted
+    MetaTrader5
 
 secrets.toml :
-    CTRADER_CLIENT_ID     = "votre_client_id"
-    CTRADER_CLIENT_SECRET = "votre_client_secret"
-    CTRADER_ACCESS_TOKEN  = "votre_access_token"
-    CTRADER_ACCOUNT_ID    = "votre_account_id"
-    CTRADER_DEMO          = "true"          # "false" pour live
-    GROQ_API_KEY          = "..."
-    ANTHROPIC_API_KEY     = "..."
-    GEMINI_API_KEY        = "..."
+    MT5_LOGIN      = "12345678"          # Numéro de compte MT5
+    MT5_PASSWORD   = "votre_mot_de_passe"
+    MT5_SERVER     = "MetaQuotes-Demo"   # Nom du serveur broker
+    MT5_PATH       = ""                  # Optionnel : chemin vers terminal.exe
+    GROQ_API_KEY   = "..."
+    ANTHROPIC_API_KEY = "..."
+    GEMINI_API_KEY = "..."
 """
 
 import streamlit as st
@@ -43,62 +41,32 @@ import requests
 import time
 import threading
 from datetime import datetime, timezone, timedelta
-from queue import Queue, Empty
 
 from streamlit_autorefresh import st_autorefresh
 
 # ──────────────────────────────────────────────────────
-# cTrader API — imports
+# MetaTrader 5 — imports
 # ──────────────────────────────────────────────────────
-CTRADER_AVAILABLE = False
+MT5_AVAILABLE = False
 _import_error = ""
 try:
-    from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
-    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
-        ProtoHeartbeatEvent,
-    )
-    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-        ProtoOAApplicationAuthReq,
-        ProtoOAApplicationAuthRes,
-        ProtoOAAccountAuthReq,
-        ProtoOAAccountAuthRes,
-        ProtoOAGetTrendbarsReq,
-        ProtoOAGetTrendbarsRes,
-        ProtoOASymbolsListReq,
-        ProtoOASymbolsListRes,
-        ProtoOASubscribeSpotsReq,
-        ProtoOAUnsubscribeSpotsReq,
-        ProtoOASpotEvent,
-        ProtoOAErrorRes,
-    )
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
-        ProtoOATrendbarPeriod,
-    )
-    CTRADER_AVAILABLE = True
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
 except ImportError as e:
     _import_error = str(e)
 
-# ──────────────────────────────────────────────────────
-# Payload type constants (cTrader Open API v2)
-# ──────────────────────────────────────────────────────
-PT_APP_AUTH_RES      = 2101
-PT_ACC_AUTH_RES      = 2103
-PT_SYMBOLS_LIST_RES  = 2115
-PT_TRENDBARS_RES     = 2138
-PT_SPOT_EVENT        = 2131
-PT_ERROR_RES         = 2162
-PT_HEARTBEAT         = 51
-
-# cTrader trendbar period → enum int
-CT_PERIOD = {
-    "M1":  1,
-    "M5":  5,
-    "M15": 7,
-    "H1":  9,
-    "H4":  10,
-    "D1":  12,
-    "W1":  13,
-}
+# Mapping timeframes MT5
+MT5_TF = {}
+if MT5_AVAILABLE:
+    MT5_TF = {
+        "M1":  mt5.TIMEFRAME_M1,
+        "M5":  mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "H1":  mt5.TIMEFRAME_H1,
+        "H4":  mt5.TIMEFRAME_H4,
+        "D1":  mt5.TIMEFRAME_D1,
+        "W1":  mt5.TIMEFRAME_W1,
+    }
 
 # Bars à télécharger par timeframe
 TF_BARS = {
@@ -128,16 +96,14 @@ try:
     GROQ_API_KEY      = st.secrets.get("GROQ_API_KEY", "")
     ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
     GEMINI_API_KEY    = st.secrets.get("GEMINI_API_KEY", "")
-    CT_CLIENT_ID      = st.secrets.get("CTRADER_CLIENT_ID", "")
-    CT_CLIENT_SECRET  = st.secrets.get("CTRADER_CLIENT_SECRET", "")
-    CT_ACCESS_TOKEN   = st.secrets.get("CTRADER_ACCESS_TOKEN", "")
-    CT_ACCOUNT_ID     = int(st.secrets.get("CTRADER_ACCOUNT_ID", "0"))
-    CT_DEMO           = str(st.secrets.get("CTRADER_DEMO", "true")).lower() == "true"
+    MT5_LOGIN         = int(st.secrets.get("MT5_LOGIN", "0"))
+    MT5_PASSWORD      = st.secrets.get("MT5_PASSWORD", "")
+    MT5_SERVER        = st.secrets.get("MT5_SERVER", "MetaQuotes-Demo")
+    MT5_PATH          = st.secrets.get("MT5_PATH", "")
 except Exception:
     GROQ_API_KEY = ANTHROPIC_API_KEY = GEMINI_API_KEY = ""
-    CT_CLIENT_ID = CT_CLIENT_SECRET = CT_ACCESS_TOKEN = ""
-    CT_ACCOUNT_ID = 0
-    CT_DEMO = True
+    MT5_LOGIN = 0
+    MT5_PASSWORD = MT5_SERVER = MT5_PATH = ""
 
 # ──────────────────────────────────────────────────────
 # SESSION STATE
@@ -146,289 +112,162 @@ _defaults = {
     "b1_signals": {}, "b2_signals": {}, "b3_signals": {},
     "b4_signals": {}, "b5_signals": {}, "b6_signals": {},
     "chat": [],
-    "ct_ready": False,       # connexion + auth OK
-    "ct_symbol_id": None,    # ID cTrader de XAUUSD
-    "ct_live_bid": None,
-    "ct_live_ask": None,
-    "ct_digits": 2,          # nb décimales XAUUSD
-    "ct_bar_cache": {},      # {tf: DataFrame}
-    "ct_cache_ts": {},       # {tf: float timestamp}
+    "mt5_ready": False,
+    "mt5_live_bid": None,
+    "mt5_live_ask": None,
+    "mt5_bar_cache": {},
+    "mt5_cache_ts": {},
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # ══════════════════════════════════════════════════════
-# cTrader Manager  (Twisted reactor dans un thread dédié)
+# MetaTrader 5 Manager
 # ══════════════════════════════════════════════════════
-class CTraderManager:
+class MT5Manager:
     """
-    Gère la connexion cTrader dans un thread Twisted séparé.
-    Interface synchrone via threading.Event + Queue.
+    Gère la connexion MetaTrader 5.
+    MT5 fonctionne nativement en synchrone sur Windows.
+    Sur Linux/Mac, la connexion n'est pas supportée nativement —
+    dans ce cas, un fallback Yahoo Finance est utilisé pour le prix live.
     """
 
-    _instance: "CTraderManager | None" = None
+    _instance: "MT5Manager | None" = None
 
     @classmethod
-    def get(cls) -> "CTraderManager":
+    def get(cls) -> "MT5Manager":
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     def __init__(self):
-        self._client           = None
-        self._lock             = threading.Lock()
-        self._started          = False
-        self._connected        = False
-        self._app_authed       = False
-        self._acc_authed       = False
-        self._symbol_id: int | None = None
-        self._digits: int      = 2
-        self._live_bid: float | None = None
-        self._live_ask: float | None = None
-        self._pending: dict    = {}   # clientMsgId → (Event, list)
-        self._msg_id: int      = 0
-        self._subscribed       = False
+        self._connected   = False
+        self._initialized = False
+        self._lock        = threading.Lock()
 
-    # ── Démarrer le réacteur Twisted ──────────────────
-    def start(self):
-        if self._started or not CTRADER_AVAILABLE:
-            return
-        if not CT_CLIENT_ID:
-            return
-        self._started = True
-        t = threading.Thread(target=self._run, daemon=True, name="ctrader-reactor")
-        t.start()
-
-    def _run(self):
-        from twisted.internet import reactor
-        host = EndPoints.DEMO_HOST if CT_DEMO else EndPoints.LIVE_HOST
-        port = EndPoints.DEMO_PORT if CT_DEMO else EndPoints.LIVE_PORT
-        self._client = Client(host, port, TcpProtocol)
-        self._client.setConnectedCallback(self._on_connected)
-        self._client.setDisconnectedCallback(self._on_disconnected)
-        self._client.setMessageReceivedCallback(self._on_message)
-        reactor.callWhenRunning(lambda: self._client.startService())
-        reactor.run(installSignalHandlers=False)
-
-    # ── Callbacks Twisted ─────────────────────────────
-    def _on_connected(self, client):
-        self._connected = True
-        req = ProtoOAApplicationAuthReq()
-        req.clientId     = CT_CLIENT_ID
-        req.clientSecret = CT_CLIENT_SECRET
-        client.sendProtoMessage(Protobuf.encode(req))
-
-    def _on_disconnected(self, client, reason):
-        self._connected  = False
-        self._app_authed = False
-        self._acc_authed = False
-        self._subscribed = False
-
-    def _on_message(self, client, raw):
-        try:
-            wrapper = Protobuf.decode(raw)
-            ptype   = wrapper.payloadType
-        except Exception:
-            return
-
-        # ── App auth ──────────────────────────────────
-        if ptype == PT_APP_AUTH_RES:
-            self._app_authed = True
-            req = ProtoOAAccountAuthReq()
-            req.ctidTraderAccountId = CT_ACCOUNT_ID
-            req.accessToken         = CT_ACCESS_TOKEN
-            client.sendProtoMessage(Protobuf.encode(req))
-
-        # ── Account auth ──────────────────────────────
-        elif ptype == PT_ACC_AUTH_RES:
-            self._acc_authed = True
-            # Charger la liste des symboles
-            req = ProtoOASymbolsListReq()
-            req.ctidTraderAccountId = CT_ACCOUNT_ID
-            client.sendProtoMessage(Protobuf.encode(req))
-
-        # ── Symbols list ──────────────────────────────
-        elif ptype == PT_SYMBOLS_LIST_RES:
-            res = ProtoOASymbolsListRes()
-            res.ParseFromString(wrapper.payload)
-            for sym in res.symbol:
-                if sym.symbolName.upper() == "XAUUSD":
-                    self._symbol_id = sym.symbolId
-                    self._digits    = sym.digits if hasattr(sym, "digits") else 2
-                    break
-            # Mettre à jour la session Streamlit (best-effort)
-            try:
-                st.session_state["ct_symbol_id"] = self._symbol_id
-                st.session_state["ct_digits"]    = self._digits
-                st.session_state["ct_ready"]     = True
-            except Exception:
-                pass
-            # Souscrire aux spots XAUUSD
-            if self._symbol_id:
-                self._subscribe_spots(client)
-
-        # ── Trendbars response ────────────────────────
-        elif ptype == PT_TRENDBARS_RES:
-            res = ProtoOAGetTrendbarsRes()
-            res.ParseFromString(wrapper.payload)
-            cid = str(wrapper.clientMsgId) if wrapper.HasField("clientMsgId") else None
-            if cid and cid in self._pending:
-                event, result = self._pending[cid]
-                result.append(res)
-                event.set()
-
-        # ── Live spot ─────────────────────────────────
-        elif ptype == PT_SPOT_EVENT:
-            ev = ProtoOASpotEvent()
-            ev.ParseFromString(wrapper.payload)
-            scale = 10 ** self._digits
-            if ev.HasField("bid"):
-                self._live_bid = ev.bid / scale
-            if ev.HasField("ask"):
-                self._live_ask = ev.ask / scale
-            try:
-                st.session_state["ct_live_bid"] = self._live_bid
-                st.session_state["ct_live_ask"] = self._live_ask
-            except Exception:
-                pass
-
-        # ── Erreur ────────────────────────────────────
-        elif ptype == PT_ERROR_RES:
-            err = ProtoOAErrorRes()
-            err.ParseFromString(wrapper.payload)
-            cid = str(wrapper.clientMsgId) if wrapper.HasField("clientMsgId") else None
-            if cid and cid in self._pending:
-                event, result = self._pending[cid]
-                result.append(None)
-                event.set()
-
-        # ── Heartbeat ─────────────────────────────────
-        elif ptype == PT_HEARTBEAT:
-            client.sendProtoMessage(Protobuf.encode(ProtoHeartbeatEvent()))
-
-    # ── Subscribe spots ───────────────────────────────
-    def _subscribe_spots(self, client):
-        req = ProtoOASubscribeSpotsReq()
-        req.ctidTraderAccountId = CT_ACCOUNT_ID
-        req.symbolId.append(self._symbol_id)
-        client.sendProtoMessage(Protobuf.encode(req))
-        self._subscribed = True
-
-    # ── Fetch trendbars (bloquant côté Streamlit) ─────
-    def fetch_bars(self, tf: str, bars: int = 300) -> "pd.DataFrame | None":
-        if not CTRADER_AVAILABLE or not self._acc_authed or not self._symbol_id:
-            return None
-        from twisted.internet import reactor
-
-        period_int = CT_PERIOD.get(tf)
-        if period_int is None:
-            return None
-
-        # Fenêtre temporelle
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        # Durée approximative en ms selon le TF
-        tf_ms = {
-            "M1": 60_000, "M5": 300_000, "M15": 900_000,
-            "H1": 3_600_000, "H4": 14_400_000, "D1": 86_400_000, "W1": 604_800_000,
-        }
-        duration_ms = tf_ms.get(tf, 60_000) * bars
-        from_ms = now_ms - duration_ms
-
+    def connect(self) -> bool:
+        """Initialise et connecte MT5."""
+        if not MT5_AVAILABLE:
+            return False
         with self._lock:
-            self._msg_id += 1
-            cid = str(self._msg_id)
+            if self._connected:
+                return True
+            try:
+                kwargs = {}
+                if MT5_PATH:
+                    kwargs["path"] = MT5_PATH
+                if not mt5.initialize(**kwargs):
+                    return False
+                self._initialized = True
 
-        event  = threading.Event()
-        result = []
-        self._pending[cid] = (event, result)
+                # Connexion au compte si identifiants fournis
+                if MT5_LOGIN and MT5_PASSWORD and MT5_SERVER:
+                    if not mt5.login(MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
+                        # Certains brokers ne nécessitent pas de login explicite
+                        pass
 
-        req = ProtoOAGetTrendbarsReq()
-        req.ctidTraderAccountId = CT_ACCOUNT_ID
-        req.symbolId            = self._symbol_id
-        req.period              = period_int
-        req.fromTimestamp       = from_ms
-        req.toTimestamp         = now_ms
-        req.count               = min(bars, 5000)
+                # Vérifier que XAUUSD est disponible
+                info = mt5.symbol_info("XAUUSD")
+                if info is None:
+                    # Essayer d'activer le symbole
+                    mt5.symbol_select("XAUUSD", True)
+                    info = mt5.symbol_info("XAUUSD")
 
-        # Envoyer depuis le thread Twisted
-        reactor.callFromThread(
-            lambda: self._client.sendProtoMessage(Protobuf.encode(req))
-        )
+                self._connected = info is not None
+                try:
+                    st.session_state["mt5_ready"] = self._connected
+                except Exception:
+                    pass
+                return self._connected
+            except Exception:
+                return False
 
-        # Attendre la réponse (max 10s)
-        got = event.wait(timeout=10.0)
-        self._pending.pop(cid, None)
+    def disconnect(self):
+        with self._lock:
+            if self._initialized and MT5_AVAILABLE:
+                mt5.shutdown()
+            self._connected   = False
+            self._initialized = False
 
-        if not got or not result or result[0] is None:
+    def fetch_bars(self, tf: str, bars: int = 300) -> "pd.DataFrame | None":
+        """Récupère les bougies OHLCV depuis MT5."""
+        if not MT5_AVAILABLE:
+            return None
+        if not self._connected:
+            if not self.connect():
+                return None
+
+        tf_mt5 = MT5_TF.get(tf)
+        if tf_mt5 is None:
             return None
 
-        res: ProtoOAGetTrendbarsRes = result[0]
-        scale = 10 ** self._digits
+        try:
+            rates = mt5.copy_rates_from_pos("XAUUSD", tf_mt5, 0, min(bars, 99999))
+            if rates is None or len(rates) == 0:
+                return None
 
-        rows = []
-        for bar in res.trendbar:
-            ts = datetime.utcfromtimestamp(bar.utcTimestampInMinutes * 60)
-            low   = bar.low / scale
-            open_ = (bar.low + bar.deltaOpen)  / scale
-            close = (bar.low + bar.deltaClose) / scale
-            high  = (bar.low + bar.deltaHigh)  / scale
-            rows.append({
-                "time":        ts,
-                "open":        open_,
-                "high":        high,
-                "low":         low,
-                "close":       close,
-                "tick_volume": int(bar.volume),
+            df = pd.DataFrame(rates)
+            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+            df["time"] = df["time"].dt.tz_localize(None)  # naive UTC
+            df = df.rename(columns={
+                "open":       "open",
+                "high":       "high",
+                "low":        "low",
+                "close":      "close",
+                "tick_volume": "tick_volume",
             })
-
-        if not rows:
+            df = df[["time", "open", "high", "low", "close", "tick_volume"]]
+            df = df.sort_values("time").reset_index(drop=True)
+            return df.tail(bars).reset_index(drop=True)
+        except Exception:
             return None
 
-        df = pd.DataFrame(rows)
-        df["time"] = pd.to_datetime(df["time"])
-        df = df.sort_values("time").reset_index(drop=True)
-
-        # Resample H4 à partir de H1
-        if tf == "H4":
-            df = df.set_index("time").resample("4h").agg({
-                "open": "first", "high": "max",
-                "low": "min", "close": "last",
-                "tick_volume": "sum",
-            }).dropna().reset_index()
-
-        return df.tail(bars).reset_index(drop=True)
+    def live_price(self) -> "float | None":
+        """Prix bid/ask en temps réel via MT5."""
+        if not MT5_AVAILABLE or not self._connected:
+            return None
+        try:
+            tick = mt5.symbol_info_tick("XAUUSD")
+            if tick is None:
+                return None
+            bid = tick.bid
+            ask = tick.ask
+            try:
+                st.session_state["mt5_live_bid"] = bid
+                st.session_state["mt5_live_ask"] = ask
+            except Exception:
+                pass
+            return round((bid + ask) / 2, 2) if bid and ask else (bid or ask)
+        except Exception:
+            return None
 
     @property
     def ready(self) -> bool:
-        return self._acc_authed and self._symbol_id is not None
-
-    @property
-    def live_price(self) -> "float | None":
-        if self._live_bid and self._live_ask:
-            return round((self._live_bid + self._live_ask) / 2, self._digits)
-        return self._live_bid or self._live_ask
+        return self._connected
 
 
 # ══════════════════════════════════════════════════════
 # INITIALISATION DU MANAGER (une seule fois par session)
 # ══════════════════════════════════════════════════════
-_ct = CTraderManager.get()
-_ct.start()
+_mt5 = MT5Manager.get()
+if MT5_AVAILABLE and MT5_LOGIN:
+    _mt5.connect()
 
 # ══════════════════════════════════════════════════════
 # FETCH DATA (avec cache Streamlit 20s)
 # ══════════════════════════════════════════════════════
 @st.cache_data(ttl=20, show_spinner=False)
 def fetch(tf: str, bars: int = 300) -> "pd.DataFrame | None":
-    return _ct.fetch_bars(tf, bars)
+    return _mt5.fetch_bars(tf, bars)
 
 
 def live_price() -> "float | None":
-    p = _ct.live_price
+    # Essayer MT5 en premier
+    p = _mt5.live_price()
     if p:
         return p
-    # Fallback HTTP si spots pas encore souscrit
+    # Fallback Yahoo Finance si MT5 non dispo (Linux/Mac)
     try:
         r = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1m&range=1d",
@@ -747,7 +586,7 @@ def bot1_run() -> tuple:
     steps: list = []
     dfw1 = fetch("W1"); dfd1 = fetch("D1")
     if dfw1 is None or dfd1 is None:
-        return None, ["❌ Données W1/D1 indisponibles — vérifier connexion cTrader."]
+        return None, ["❌ Données W1/D1 indisponibles — vérifier connexion MT5."]
     dfw1 = indicators(dfw1); dfd1 = indicators(dfd1)
     biais_w1 = trend_direction(dfw1); biais_d1 = trend_direction(dfd1)
     if biais_w1 == "NEUTRE" or biais_d1 == "NEUTRE":
@@ -1138,28 +977,45 @@ def bot6_run() -> tuple:
 # ══════════════════════════════════════════════════════
 # UI PRINCIPALE
 # ══════════════════════════════════════════════════════
-st.title("🥇 6 BOTS IA TRADING — XAUUSD — cTrader")
-st.caption("Données temps réel cTrader Open API | Refresh automatique 30s")
+st.title("🥇 6 BOTS IA TRADING — XAUUSD — MetaTrader 5")
+st.caption("Données temps réel MetaTrader 5 | Refresh automatique 30s")
 
 # ── Bannière statut connexion ──────────────────────────
-if not CTRADER_AVAILABLE:
-    st.error(f"❌ Bibliothèque ctrader-open-api non installée. "
-             f"Ajoutez `ctrader-open-api` et `twisted` à requirements.txt. "
-             f"({_import_error})")
-elif not CT_CLIENT_ID:
-    st.warning("⚠️ Identifiants cTrader manquants dans `.streamlit/secrets.toml`. "
-               "Ajouter : CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, "
-               "CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID, CTRADER_DEMO")
+if not MT5_AVAILABLE:
+    st.error(
+        f"❌ Bibliothèque MetaTrader5 non installée. "
+        f"Ajoutez `MetaTrader5` à requirements.txt. "
+        f"⚠️ MetaTrader5 est uniquement supporté sur **Windows**. "
+        f"({_import_error})"
+    )
+elif not MT5_LOGIN:
+    st.warning(
+        "⚠️ Identifiants MT5 manquants dans `.streamlit/secrets.toml`. "
+        "Ajouter : MT5_LOGIN, MT5_PASSWORD, MT5_SERVER (et optionnellement MT5_PATH)."
+    )
 else:
-    ready = _ct.ready
-    mode  = "DÉMO" if CT_DEMO else "LIVE"
+    ready = _mt5.ready
     if ready:
-        sym_id = st.session_state.get("ct_symbol_id", _ct._symbol_id)
-        st.success(f"✅ cTrader connecté ({mode}) | XAUUSD symbol ID : {sym_id} | "
-                   f"Digits : {st.session_state.get('ct_digits', 2)}")
+        acc_info = None
+        try:
+            acc_info = mt5.account_info()
+        except Exception:
+            pass
+        if acc_info:
+            st.success(
+                f"✅ MT5 connecté | Compte : {acc_info.login} | "
+                f"Broker : {acc_info.company} | "
+                f"Serveur : {acc_info.server} | "
+                f"Balance : {acc_info.balance:.2f} {acc_info.currency}"
+            )
+        else:
+            st.success("✅ MT5 connecté — XAUUSD disponible.")
     else:
-        st.warning(f"⏳ Connexion cTrader en cours ({mode})… "
-                   "Patienter quelques secondes puis relancer l'analyse.")
+        st.warning(
+            "⏳ Connexion MT5 en cours… "
+            "Vérifiez que le terminal MetaTrader 5 est ouvert et connecté, "
+            "puis relancez l'analyse."
+        )
 
 BOT_INFO = [
     ("🔵 Bot 1 — Swing Très Puissant",     "W1/D1/H4 | OB H4 | FVG | Volume/ATR"),
@@ -1192,10 +1048,10 @@ for i, (tab, (bot_name, bot_desc), runner, ck, tf_c) in enumerate(
                 st.metric("XAUUSD live", f"{p:.2f} $")
 
         if run_btn:
-            if not CTRADER_AVAILABLE:
-                st.error("ctrader-open-api non installé.")
-            elif not _ct.ready:
-                st.warning("Connexion cTrader pas encore prête — réessayer dans quelques secondes.")
+            if not MT5_AVAILABLE:
+                st.error("MetaTrader5 non installé (Windows requis).")
+            elif not _mt5.ready:
+                st.warning("Connexion MT5 pas encore prête — vérifiez que le terminal MT5 est ouvert.")
             else:
                 with st.spinner("Analyse multi-timeframes en cours…"):
                     sig, steps = runner()
@@ -1241,6 +1097,21 @@ for i, (tab, (bot_name, bot_desc), runner, ck, tf_c) in enumerate(
 # ── Dashboard ─────────────────────────────────────────
 with tabs[6]:
     st.subheader("📊 Dashboard — Tous les Bots XAUUSD")
+
+    # Infos compte MT5
+    if MT5_AVAILABLE and _mt5.ready:
+        try:
+            acc = mt5.account_info()
+            if acc:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Balance", f"{acc.balance:.2f} {acc.currency}")
+                c2.metric("Equity",  f"{acc.equity:.2f} {acc.currency}")
+                c3.metric("Marge libre", f"{acc.margin_free:.2f} {acc.currency}")
+                c4.metric("Levier", f"1:{acc.leverage}")
+                st.divider()
+        except Exception:
+            pass
+
     rows = []
     for i, (bot_name, _) in enumerate(BOT_INFO):
         c = st.session_state[CACHE_KEYS[i]].get("XAUUSD")
